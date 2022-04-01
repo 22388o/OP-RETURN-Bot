@@ -10,11 +10,13 @@ import lnrpc.Invoice.InvoiceState._
 import models.{InvoiceDAO, InvoiceDb}
 import org.bitcoins.core.config.MainNet
 import org.bitcoins.core.currency._
+import org.bitcoins.core.number._
 import org.bitcoins.core.protocol.ln.LnInvoice
 import org.bitcoins.core.protocol.ln.LnTag.PaymentHashTag
 import org.bitcoins.core.protocol.ln.node.NodeId
 import org.bitcoins.core.protocol.script.ScriptPubKey
 import org.bitcoins.core.protocol.transaction._
+import org.bitcoins.core.psbt.PSBT
 import org.bitcoins.core.script.constant.ScriptConstant
 import org.bitcoins.core.script.control.OP_RETURN
 import org.bitcoins.core.util.{BitcoinScriptUtil, FutureUtil}
@@ -27,9 +29,7 @@ import org.bitcoins.lnd.rpc.LndUtils._
 import play.api.data._
 import play.api.mvc._
 import scodec.bits.ByteVector
-import signrpc.TxOut
 import slick.dbio.DBIOAction
-import walletrpc.SendOutputsRequest
 
 import javax.inject.Inject
 import scala.collection._
@@ -325,11 +325,9 @@ class Controller @Inject() (cc: MessagesControllerComponents)
   }
 
   def startSubscription(): Future[Done] = {
-    val parallelism = Runtime.getRuntime.availableProcessors()
-
     lnd
       .subscribeInvoices()
-      .mapAsyncUnordered(parallelism) { invoice =>
+      .mapAsyncUnordered(1) { invoice =>
         invoice.state match {
           case OPEN | Unrecognized(_) | InvoiceState.ACCEPTED => Future.unit
           case CANCELED =>
@@ -425,17 +423,15 @@ class Controller @Inject() (cc: MessagesControllerComponents)
       TransactionOutput(Satoshis.zero, scriptPubKey)
     }
 
-    val txOut =
-      TxOut(output.value.satoshis.toLong, output.scriptPubKey.asmBytes)
-
-    val request: SendOutputsRequest = SendOutputsRequest(
-      satPerKw = feeRate.toSatoshisPerKW.toLong,
-      outputs = Vector(txOut),
-      label = s"OP_RETURN Bot: $message",
-      spendUnconfirmed = true)
+    val unsignedTx = BaseTransaction(version = Int32.one,
+                                     inputs = Vector.empty,
+                                     outputs = Vector(output),
+                                     lockTime = UInt32.zero)
 
     val createTxF = for {
-      transaction <- lnd.sendOutputs(request)
+      unsignedPsbt <- lnd.fundPSBT(PSBT.fromUnsignedTx(unsignedTx), feeRate)
+      signed <- lnd.finalizePSBT(unsignedPsbt)
+      transaction <- Future.fromTry(signed.extractTransactionAndValidate)
       errorOpt <- lnd.publishTransaction(transaction)
 
       // send if onion message
